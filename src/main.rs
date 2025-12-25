@@ -11,7 +11,7 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use solana_keypair::{Keypair, read_keypair_file};
+use solana_keypair::{read_keypair_file, Keypair};
 use tracing::info;
 
 use crate::leader::{GrpcLeaderProvider, LeaderProvider, SseLeaderProvider};
@@ -32,7 +32,11 @@ struct Args {
 #[derive(Subcommand)]
 enum Mode {
     Sse {
-        #[arg(long, env, default_value = "https://areweslotyet.xyz/api/leader-stream")]
+        #[arg(
+            long,
+            env,
+            default_value = "https://areweslotyet.xyz/api/leader-stream"
+        )]
         sse_url: String,
     },
     Grpc {
@@ -156,10 +160,7 @@ async fn main() -> anyhow::Result<()> {
             info!("using SSE leader provider: {}", sse_url);
             Arc::new(SseLeaderProvider::new(&sse_url))
         }
-        Mode::Grpc {
-            grpc_url,
-            rpc_url,
-        } => {
+        Mode::Grpc { grpc_url, rpc_url } => {
             info!(
                 "using gRPC leader provider: {} + RPC: {}",
                 grpc_url, rpc_url
