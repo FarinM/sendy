@@ -1,0 +1,36 @@
+[package]
+name = "sendy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+reqwest = { version = "0.12", features = ["stream"] }
+reqwest-eventsource = "0.6"
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+bs58 = "0.5"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+
+yellowstone-grpc-client = "10"
+yellowstone-grpc-proto = "10"
+
+solana-tls-utils = "=3.0.0"
+solana-quic-definitions = "=3.0.0"
+solana-keypair = "=3.0.0"
+solana-signer = "=3.0.0"
+solana-pubkey = "=3.0.0"
+solana-transaction = "=3.0.0"
+
+solana-client = "=3.0.0"
+solana-rpc-client-api = "=3.0.0"
+dashmap = "6.1.0"
