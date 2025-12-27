@@ -89,9 +89,13 @@ impl TxnSender {
             anyhow::bail!("no leader data available");
         };
 
-        self.send_to(leaders.current, wire_tx.clone());
         if leaders.current != leaders.next {
-            self.send_to(leaders.next, wire_tx);
+            tokio::join!(
+                self.send_to(leaders.current, &wire_tx),
+                self.send_to(leaders.next, &wire_tx)
+            );
+        } else {
+            self.send_to(leaders.current, &wire_tx).await;
         }
 
         debug!("sent tx {}", signature);
@@ -99,38 +103,36 @@ impl TxnSender {
         Ok(signature)
     }
 
-    fn send_to(&self, addr: SocketAddr, data: Bytes) {
+    async fn send_to(&self, addr: SocketAddr, data: &Bytes) {
         let endpoint = self.endpoint.clone();
         let connections = self.connections.clone();
 
-        tokio::spawn(async move {
-            let conn = match get_or_connect(&endpoint, &connections, addr).await {
-                Ok(c) => c,
-                Err(e) => {
-                    debug!("connect failed to {}: {:?}", addr, e);
-                    return;
-                }
-            };
-
-            match timeout(Duration::from_millis(500), async {
-                let mut stream = conn.open_uni().await?;
-                stream.write_all(&data).await?;
-                stream.finish()?;
-                anyhow::Ok(())
-            })
-            .await
-            {
-                Ok(Ok(())) => debug!("sent to {}", addr),
-                Ok(Err(e)) => {
-                    debug!("send error to {}: {:?}", addr, e);
-                    connections.write().await.remove(&addr);
-                }
-                Err(_) => {
-                    debug!("send timeout to {}", addr);
-                    connections.write().await.remove(&addr);
-                }
+        let conn = match get_or_connect(&endpoint, &connections, addr).await {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("connect failed to {}: {:?}", addr, e);
+                return;
             }
-        });
+        };
+
+        match timeout(Duration::from_millis(500), async {
+            let mut stream = conn.open_uni().await?;
+            stream.write_all(data).await?;
+            stream.finish()?;
+            anyhow::Ok(())
+        })
+        .await
+        {
+            Ok(Ok(())) => debug!("sent to {}", addr),
+            Ok(Err(e)) => {
+                debug!("send error to {}: {:?}", addr, e);
+                connections.write().await.remove(&addr);
+            }
+            Err(_) => {
+                debug!("send timeout to {}", addr);
+                connections.write().await.remove(&addr);
+            }
+        }
     }
 }
 
