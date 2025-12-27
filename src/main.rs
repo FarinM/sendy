@@ -5,13 +5,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::State,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
 use solana_keypair::{read_keypair_file, Keypair};
+use sonic_rs::{JsonValueTrait, Value};
 use tracing::info;
 
 use crate::leader::{GrpcLeaderProvider, LeaderProvider, SseLeaderProvider};
@@ -48,88 +51,61 @@ enum Mode {
     },
 }
 
-#[derive(Deserialize)]
-struct RpcRequest {
-    #[allow(unused)]
-    jsonrpc: String,
-    id: serde_json::Value,
-    method: String,
-    params: Vec<serde_json::Value>,
+fn json_response(body: String) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
-#[derive(Serialize)]
-struct RpcResponse<T> {
-    jsonrpc: String,
-    id: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<RpcError>,
+fn json_ok(id: &Value, result: &str) -> Response {
+    json_response(format!(
+        r#"{{"jsonrpc":"2.0","id":{},"result":"{}"}}"#,
+        id, result
+    ))
 }
 
-#[derive(Serialize)]
-struct RpcError {
-    code: i32,
-    message: String,
+fn json_error(id: &Value, code: i32, message: &str) -> Response {
+    json_response(format!(
+        r#"{{"jsonrpc":"2.0","id":{},"error":{{"code":{},"message":"{}"}}}}"#,
+        id, code, message
+    ))
 }
 
-impl<T> RpcResponse<T> {
-    fn ok(id: serde_json::Value, result: T) -> Self {
-        Self {
-            jsonrpc: "2.0".into(),
-            id,
-            result: Some(result),
-            error: None,
-        }
-    }
-
-    fn err(id: serde_json::Value, code: i32, message: String) -> RpcResponse<()> {
-        RpcResponse {
-            jsonrpc: "2.0".into(),
-            id,
-            result: None,
-            error: Some(RpcError { code, message }),
-        }
-    }
-}
-
-async fn rpc_handler(
-    State(sender): State<Arc<TxnSender>>,
-    Json(req): Json<RpcRequest>,
-) -> Json<serde_json::Value> {
-    let response = match req.method.as_str() {
-        "sendTransaction" => {
-            let tx = req.params.first().and_then(|v| v.as_str());
-            let encoding = req
-                .params
-                .get(1)
-                .and_then(|v| v.get("encoding"))
-                .and_then(|v| v.as_str());
-
-            match tx {
-                Some(tx) => match sender.send(tx, encoding).await {
-                    Ok(sig) => serde_json::to_value(RpcResponse::ok(req.id, sig)).unwrap(),
-                    Err(e) => {
-                        serde_json::to_value(RpcResponse::<()>::err(req.id, -32000, e.to_string()))
-                            .unwrap()
-                    }
-                },
-                None => serde_json::to_value(RpcResponse::<()>::err(
-                    req.id,
-                    -32602,
-                    "missing transaction".into(),
-                ))
-                .unwrap(),
-            }
-        }
-        _ => serde_json::to_value(RpcResponse::<()>::err(
-            req.id,
-            -32601,
-            "method not found".into(),
-        ))
-        .unwrap(),
+async fn rpc_handler(State(sender): State<Arc<TxnSender>>, body: Bytes) -> Response {
+    let parsed: Value = match sonic_rs::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return json_error(&Value::default(), -32700, "parse error"),
     };
-    Json(response)
+
+    let default_id = Value::default();
+    let id = parsed.get("id").unwrap_or(&default_id);
+
+    let Some(method) = parsed.get("method").and_then(|v| v.as_str()) else {
+        return json_error(id, -32600, "invalid request");
+    };
+
+    if method != "sendTransaction" {
+        return json_error(id, -32601, "method not found");
+    }
+
+    let params = parsed.get("params");
+
+    let Some(tx) = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()) else {
+        return json_error(id, -32602, "missing transaction");
+    };
+
+    let encoding = params
+        .and_then(|p| p.get(1))
+        .and_then(|p| p.get("encoding"))
+        .and_then(|v| v.as_str());
+
+    match sender.send(tx, encoding).await {
+        Ok(sig) => json_ok(id, &sig),
+        Err(e) => json_error(id, -32000, &e.to_string()),
+    }
 }
 
 async fn health() -> &'static str {
