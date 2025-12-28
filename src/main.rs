@@ -13,8 +13,8 @@ use axum::{
     Router,
 };
 use clap::{Parser, Subcommand};
+use memchr::memmem;
 use solana_keypair::{read_keypair_file, Keypair};
-use sonic_rs::{JsonValueTrait, Value};
 use tracing::info;
 
 use crate::leader::{GrpcLeaderProvider, LeaderProvider, SseLeaderProvider};
@@ -60,30 +60,57 @@ fn json_response(body: String) -> Response {
         .into_response()
 }
 
-fn json_ok(id: &Value, result: &str) -> Response {
+fn json_ok(id: &str, result: &str) -> Response {
     json_response(format!(
         r#"{{"jsonrpc":"2.0","id":{},"result":"{}"}}"#,
         id, result
     ))
 }
 
-fn json_error(id: &Value, code: i32, message: &str) -> Response {
+fn json_error(id: &str, code: i32, message: &str) -> Response {
     json_response(format!(
         r#"{{"jsonrpc":"2.0","id":{},"error":{{"code":{},"message":"{}"}}}}"#,
         id, code, message
     ))
 }
 
+#[inline]
+fn extract_id(body: &[u8]) -> Option<&str> {
+    let start = memmem::find(body, b"\"id\":")? + 5;
+    // Skip whitespace
+    let start = start + body[start..].iter().position(|&b| b != b' ')?;
+    // Find end (comma, whitespace, or })
+    let end = body[start..]
+        .iter()
+        .position(|&b| b == b',' || b == b'}' || b == b' ' || b == b'\n')?;
+    std::str::from_utf8(&body[start..start + end]).ok()
+}
+
+#[inline]
+fn extract_method(body: &[u8]) -> Option<&str> {
+    let start = memmem::find(body, b"\"method\":\"")? + 10;
+    let end = start + memchr::memchr(b'"', &body[start..])?;
+    std::str::from_utf8(&body[start..end]).ok()
+}
+
+#[inline]
+fn extract_tx(body: &[u8]) -> Option<&str> {
+    let start = memmem::find(body, b"\"params\":[\"")? + 11;
+    let end = start + memchr::memchr(b'"', &body[start..])?;
+    std::str::from_utf8(&body[start..end]).ok()
+}
+
+#[inline]
+fn extract_encoding(body: &[u8]) -> Option<&str> {
+    let start = memmem::find(body, b"\"encoding\":\"")? + 12;
+    let end = start + memchr::memchr(b'"', &body[start..])?;
+    std::str::from_utf8(&body[start..end]).ok()
+}
+
 async fn rpc_handler(State(sender): State<Arc<TxnSender>>, body: Bytes) -> Response {
-    let parsed: Value = match sonic_rs::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => return json_error(&Value::default(), -32700, "parse error"),
-    };
+    let id = extract_id(&body).unwrap_or("null");
 
-    let default_id = Value::default();
-    let id = parsed.get("id").unwrap_or(&default_id);
-
-    let Some(method) = parsed.get("method").and_then(|v| v.as_str()) else {
+    let Some(method) = extract_method(&body) else {
         return json_error(id, -32600, "invalid request");
     };
 
@@ -91,16 +118,11 @@ async fn rpc_handler(State(sender): State<Arc<TxnSender>>, body: Bytes) -> Respo
         return json_error(id, -32601, "method not found");
     }
 
-    let params = parsed.get("params");
-
-    let Some(tx) = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()) else {
+    let Some(tx) = extract_tx(&body) else {
         return json_error(id, -32602, "missing transaction");
     };
 
-    let encoding = params
-        .and_then(|p| p.get(1))
-        .and_then(|p| p.get("encoding"))
-        .and_then(|v| v.as_str());
+    let encoding = extract_encoding(&body);
 
     match sender.send(tx, encoding).await {
         Ok(sig) => json_ok(id, &sig),

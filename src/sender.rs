@@ -71,7 +71,7 @@ impl TxnSender {
                         {
                             warn!("prewarm failed for {}: {:?}", next_addr, e);
                         } else {
-                            info!("prewarmed connection to {}", next_addr);
+                            debug!("prewarmed connection to {}", next_addr);
                             last_prewarmed = Some(next_addr);
                         }
                     }
