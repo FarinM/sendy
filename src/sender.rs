@@ -1,10 +1,11 @@
 use bytes::Bytes;
+use flume::{Receiver, Sender};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::prelude::*;
 use quinn::crypto::rustls::QuicClientConfig;
@@ -20,12 +21,15 @@ use crate::leader::LeaderProvider;
 
 const MAX_TX_SIZE: usize = 1232;
 const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
-const PREWARM_INTERVAL: Duration = Duration::from_millis(100);
+const PREWARM_INTERVAL: Duration = Duration::from_millis(10);
+const NUM_WORKERS: usize = 16;
+const SEND_QUEUE_SIZE: usize = 1024;
 
 pub struct TxnSender {
     endpoint: Endpoint,
     leaders: Arc<dyn LeaderProvider>,
     connections: Arc<RwLock<HashMap<SocketAddr, Connection>>>,
+    send_queue: Sender<(SocketAddr, Bytes)>,
 }
 
 fn crypto_provider() -> CryptoProvider {
@@ -43,10 +47,19 @@ impl TxnSender {
         let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
         endpoint.set_default_client_config(client_config);
 
+        let (send_queue, rx) = flume::bounded::<(SocketAddr, Bytes)>(SEND_QUEUE_SIZE);
+
+        let connections = Arc::new(RwLock::new(HashMap::new()));
+
+        for _ in 0..NUM_WORKERS {
+            spawn_send_worker(rx.clone(), endpoint.clone(), connections.clone());
+        }
+
         let sender = Self {
             endpoint,
             leaders,
-            connections: Arc::new(RwLock::new(HashMap::new())),
+            connections,
+            send_queue,
         };
 
         sender.spawn_prewarm_task();
@@ -89,51 +102,58 @@ impl TxnSender {
             anyhow::bail!("no leader data available");
         };
 
+        self.send_to(leaders.current, wire_tx.clone());
         if leaders.current != leaders.next {
-            tokio::join!(
-                self.send_to(leaders.current, &wire_tx),
-                self.send_to(leaders.next, &wire_tx)
-            );
-        } else {
-            self.send_to(leaders.current, &wire_tx).await;
+            self.send_to(leaders.next, wire_tx);
         }
-
-        debug!("sent tx {}", signature);
 
         Ok(signature)
     }
 
-    async fn send_to(&self, addr: SocketAddr, data: &Bytes) {
-        let endpoint = self.endpoint.clone();
-        let connections = self.connections.clone();
-
-        let conn = match get_or_connect(&endpoint, &connections, addr).await {
-            Ok(c) => c,
-            Err(e) => {
-                debug!("connect failed to {}: {:?}", addr, e);
-                return;
-            }
-        };
-
-        match timeout(Duration::from_millis(500), async {
-            let mut stream = conn.open_uni().await?;
-            stream.write_all(data).await?;
-            stream.finish()?;
-            anyhow::Ok(())
-        })
-        .await
-        {
-            Ok(Ok(())) => debug!("sent to {}", addr),
-            Ok(Err(e)) => {
-                debug!("send error to {}: {:?}", addr, e);
-                connections.write().await.remove(&addr);
-            }
-            Err(_) => {
-                debug!("send timeout to {}", addr);
-                connections.write().await.remove(&addr);
-            }
+    fn send_to(&self, addr: SocketAddr, data: Bytes) {
+        if self.send_queue.try_send((addr, data)).is_err() {
+            warn!("send queue full, dropping tx to {}", addr);
         }
     }
+}
+
+fn spawn_send_worker(
+    rx: Receiver<(SocketAddr, Bytes)>,
+    endpoint: Endpoint,
+    connections: Arc<RwLock<HashMap<SocketAddr, Connection>>>,
+) {
+    tokio::spawn(async move {
+        while let Ok((addr, data)) = rx.recv_async().await {
+            let start = Instant::now();
+
+            let conn = match get_or_connect(&endpoint, &connections, addr).await {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!("connect failed to {}: {:?}", addr, e);
+                    continue;
+                }
+            };
+
+            match timeout(Duration::from_millis(500), async {
+                let mut stream = conn.open_uni().await?;
+                stream.write_all(&data).await?;
+                stream.finish()?;
+                anyhow::Ok(())
+            })
+            .await
+            {
+                Ok(Ok(())) => debug!("sent to {} in {:?}", addr, start.elapsed()),
+                Ok(Err(e)) => {
+                    debug!("send error to {}: {:?}", addr, e);
+                    connections.write().await.remove(&addr);
+                }
+                Err(_) => {
+                    debug!("send timeout to {}", addr);
+                    connections.write().await.remove(&addr);
+                }
+            }
+        }
+    });
 }
 
 async fn prewarm_connection(
