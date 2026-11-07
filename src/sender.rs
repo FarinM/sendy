@@ -18,8 +18,9 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::leader::LeaderProvider;
+use crate::transaction_v1;
 
-const MAX_TX_SIZE: usize = 1232;
+const MAX_LEGACY_TX_SIZE: usize = 1232;
 const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
 const PREWARM_INTERVAL: Duration = Duration::from_millis(10);
 const NUM_WORKERS: usize = 16;
@@ -250,14 +251,27 @@ fn decode_tx(data: &str, encoding: Option<&str>) -> anyhow::Result<(Bytes, Strin
         Some(other) => anyhow::bail!("unsupported encoding: {}", other),
     };
 
-    if bytes.len() > MAX_TX_SIZE {
+    let signature = bs58::encode(first_signature(&bytes)?).into_string();
+
+    Ok((Bytes::from(bytes), signature))
+}
+
+fn first_signature(wire: &[u8]) -> anyhow::Result<&[u8; 64]> {
+    if wire.first() == Some(&transaction_v1::VERSION_BYTE) {
+        return Ok(&transaction_v1::signatures(wire)?[0]);
+    }
+
+    if wire.len() > MAX_LEGACY_TX_SIZE {
         anyhow::bail!("transaction too large");
     }
 
-    if bytes.len() < 65 {
+    if wire.len() < 65 {
         anyhow::bail!("transaction too small");
     }
-    let signature = bs58::encode(&bytes[1..65]).into_string();
 
-    Ok((Bytes::from(bytes), signature))
+    if wire[0] & 0x80 != 0 {
+        anyhow::bail!("unsupported transaction version");
+    }
+
+    Ok(wire[1..65].try_into().unwrap())
 }

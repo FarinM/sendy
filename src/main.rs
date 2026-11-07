@@ -1,5 +1,6 @@
 mod leader;
 mod sender;
+mod transaction_v1;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
