@@ -77,35 +77,66 @@ fn json_error(id: &str, code: i32, message: &str) -> Response {
 
 #[inline]
 fn extract_id(body: &[u8]) -> Option<&str> {
-    let start = memmem::find(body, b"\"id\":")? + 5;
-    // Skip whitespace
-    let start = start + body[start..].iter().position(|&b| b != b' ')?;
-    // Find end (comma, whitespace, or })
-    let end = body[start..]
+    let start = find_value(body, b"\"id\"")?;
+    let len = body[start..]
         .iter()
-        .position(|&b| b == b',' || b == b'}' || b == b' ' || b == b'\n')?;
-    std::str::from_utf8(&body[start..start + end]).ok()
+        .position(|&b| b == b',' || b == b'}' || is_json_whitespace(b))?;
+    std::str::from_utf8(&body[start..start + len]).ok()
 }
 
 #[inline]
 fn extract_method(body: &[u8]) -> Option<&str> {
-    let start = memmem::find(body, b"\"method\":\"")? + 10;
-    let end = start + memchr::memchr(b'"', &body[start..])?;
-    std::str::from_utf8(&body[start..end]).ok()
+    string_at(body, find_value(body, b"\"method\"")?)
 }
 
 #[inline]
 fn extract_tx(body: &[u8]) -> Option<&str> {
-    let start = memmem::find(body, b"\"params\":[\"")? + 11;
-    let end = start + memchr::memchr(b'"', &body[start..])?;
-    std::str::from_utf8(&body[start..end]).ok()
+    let params = find_value(body, b"\"params\"")?;
+    if body.get(params) != Some(&b'[') {
+        return None;
+    }
+    string_at(body, skip_whitespace(body, params + 1))
 }
 
 #[inline]
 fn extract_encoding(body: &[u8]) -> Option<&str> {
-    let start = memmem::find(body, b"\"encoding\":\"")? + 12;
-    let end = start + memchr::memchr(b'"', &body[start..])?;
-    std::str::from_utf8(&body[start..end]).ok()
+    string_at(body, find_value(body, b"\"encoding\"")?)
+}
+
+#[inline]
+fn find_value(body: &[u8], key: &[u8]) -> Option<usize> {
+    let mut from = 0;
+    loop {
+        let key_end = from + memmem::find(&body[from..], key)? + key.len();
+        let colon = skip_whitespace(body, key_end);
+        if body.get(colon) == Some(&b':') {
+            return Some(skip_whitespace(body, colon + 1));
+        }
+        from = key_end;
+    }
+}
+
+#[inline]
+fn string_at(body: &[u8], pos: usize) -> Option<&str> {
+    if body.get(pos) != Some(&b'"') {
+        return None;
+    }
+    let start = pos + 1;
+    let len = memchr::memchr(b'"', &body[start..])?;
+    std::str::from_utf8(&body[start..start + len]).ok()
+}
+
+#[inline]
+fn is_json_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+#[inline]
+fn skip_whitespace(buf: &[u8], pos: usize) -> usize {
+    pos + buf[pos..]
+        .iter()
+        .take_while(|&&b| is_json_whitespace(b))
+        .count()
 }
 
 async fn rpc_handler(State(sender): State<Arc<TxnSender>>, body: Bytes) -> Response {
